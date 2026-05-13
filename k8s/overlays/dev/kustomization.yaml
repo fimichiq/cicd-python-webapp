@@ -1,0 +1,36 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: app-dev
+
+resources:
+  - namespace.yaml
+  - ../../base
+
+# Map the logical image name in base to a real GHCR reference.
+# CD workflow (Phase 7) overrides newTag dynamically to the build SHA.
+images:
+  - name: cicd-python-webapp
+    newName: ghcr.io/fimichiq/cicd-python-webapp
+    newTag: main
+
+replicas:
+  - name: app
+    count: 1
+
+# Per-env config: APP_VERSION exposed via /version endpoint.
+# Kustomize hashes the generated ConfigMap name and rewrites references
+# in Deployment, so every config change forces a rolling update.
+configMapGenerator:
+  - name: app-config
+    literals:
+      - APP_VERSION=dev
+
+patches:
+  - target:
+      kind: Ingress
+      name: app
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: dev.app.local

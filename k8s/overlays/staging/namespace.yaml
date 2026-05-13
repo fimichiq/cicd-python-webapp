@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-staging
+  labels:
+    app.kubernetes.io/part-of: cicd-python-webapp
+    env: staging

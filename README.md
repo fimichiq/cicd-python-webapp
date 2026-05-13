@@ -61,6 +61,19 @@ microk8s enable ingress dns
 echo "127.0.0.1 dev.app.local staging.app.local prod.app.local" | sudo tee -a /etc/hosts
 ```
 
+On hosts running **firewalld** (Fedora, RHEL, CentOS) the pod and service CIDRs
+**and the Calico CNI interfaces** must be in the `trusted` zone, otherwise
+inter-pod traffic is silently dropped and ingress times out with
+`504 Gateway Time-out`:
+
+```bash
+sudo firewall-cmd --permanent --zone=trusted --add-source=10.1.0.0/16
+sudo firewall-cmd --permanent --zone=trusted --add-source=10.152.183.0/24
+sudo firewall-cmd --permanent --zone=trusted --add-interface=vxlan.calico
+sudo firewall-cmd --permanent --zone=trusted --add-interface=cali+
+sudo firewall-cmd --reload
+```
+
 Set the GHCR owner in the overlay (replace `OWNER` with your GitHub username):
 
 ```bash

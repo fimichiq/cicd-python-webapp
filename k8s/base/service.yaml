@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: app
+  labels:
+    app.kubernetes.io/name: cicd-python-webapp
+    app.kubernetes.io/component: webapp
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cicd-python-webapp
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
