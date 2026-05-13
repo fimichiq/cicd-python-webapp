@@ -29,3 +29,6 @@ htmlcov/
 .vscode/
 *.swp
 .DS_Store
+
+# Personal interview prep — NOT part of the deliverable
+INTERVIEW_PREP.md

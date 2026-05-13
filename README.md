@@ -51,3 +51,31 @@ curl -s localhost:8000/version
 The image is multi-stage (builder + slim runtime), runs **gunicorn** with two
 workers, and executes as a non-root user (UID `10001`). A built-in `HEALTHCHECK`
 hits `/health` every 30 seconds.
+
+## Deploy manually to microk8s
+
+One-time cluster setup:
+
+```bash
+microk8s enable ingress dns
+echo "127.0.0.1 dev.app.local staging.app.local prod.app.local" | sudo tee -a /etc/hosts
+```
+
+Set the GHCR owner in the overlay (replace `OWNER` with your GitHub username):
+
+```bash
+sed -i 's|ghcr.io/OWNER/|ghcr.io/<your-gh-user>/|g' k8s/overlays/*/kustomization.yaml
+```
+
+Deploy the **dev** environment:
+
+```bash
+kubectl kustomize k8s/overlays/dev | kubectl apply -f -
+kubectl rollout status deployment/app -n app-dev --timeout=120s
+
+curl -s http://dev.app.local/health
+curl -s http://dev.app.local/version
+```
+
+For `staging` and `prod`, swap the overlay path. Each lives in its own namespace
+(`app-dev`, `app-staging`, `app-prod`) and has a distinct ingress host.
