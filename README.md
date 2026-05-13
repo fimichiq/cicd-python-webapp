@@ -36,3 +36,18 @@ curl -s localhost:8000/version
 ```bash
 pytest
 ```
+
+## Run in Docker
+
+```bash
+docker build -t cicd-python-webapp:dev .
+docker run --rm -p 8000:8000 -e APP_VERSION=docker cicd-python-webapp:dev
+
+# in another shell
+curl -s localhost:8000/health
+curl -s localhost:8000/version
+```
+
+The image is multi-stage (builder + slim runtime), runs **gunicorn** with two
+workers, and executes as a non-root user (UID `10001`). A built-in `HEALTHCHECK`
+hits `/health` every 30 seconds.

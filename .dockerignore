@@ -1,0 +1,39 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# CI / project config that doesn't belong in build context
+.github
+.claude
+
+# Python
+.venv
+venv
+.env
+.env.*
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.coverage
+.coverage.*
+htmlcov
+*.egg-info
+
+# IDE / OS
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# Tests (not needed in runtime image)
+tests
+
+# Docs (not needed in runtime image)
+README.md
+*.md
+
+# Kubernetes manifests (separate artifact)
+k8s
