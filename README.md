@@ -92,3 +92,147 @@ curl -s http://dev.app.local/version
 
 For `staging` and `prod`, swap the overlay path. Each lives in its own namespace
 (`app-dev`, `app-staging`, `app-prod`) and has a distinct ingress host.
+
+## Continuous deployment to `dev`
+
+Once CI publishes an image to GHCR, the `CD (dev)` workflow
+(`.github/workflows/cd-dev.yml`) deploys that exact commit to the local
+microk8s cluster.
+
+Flow:
+
+1. `CI` finishes successfully on `main` and publishes
+   `ghcr.io/<owner>/cicd-python-webapp:sha-<short>`.
+2. `CD (dev)` is triggered via `workflow_run`, pinned to that commit's image
+   tag in `k8s/overlays/dev/kustomization.yaml`.
+3. `kubectl apply -k k8s/overlays/dev` + `kubectl rollout status` (120 s).
+4. Smoke test: `kubectl exec` into the new pod and `GET /health`.
+5. On any failure: `kubectl rollout undo` and re-wait — the previous
+   ReplicaSet takes over.
+
+The smoke test runs *inside* the pod rather than through the Ingress; the
+local cluster has an unrelated CNI/iptables issue that breaks ingress→pod
+traffic. The in-pod check is a stronger gate for "is the rollout healthy"
+anyway — it decouples application health from ingress correctness.
+
+You can also trigger CD manually:
+
+```bash
+gh workflow run "CD (dev)" -f sha=<full-or-empty-for-HEAD>
+```
+
+### Deploy a feature branch to `dev`
+
+`dev` is intentionally a "does it run" environment, so you can sideload any
+branch's HEAD into it without going through `main`. The flow:
+
+1. Push your feature branch (`git push origin feature/<x>`). CI builds and
+   pushes a `sha-<short>` image for that commit to GHCR — feature branches
+   build images too, only `main` gets the floating `:main` tag and only `v*`
+   tags get semver tags.
+2. Wait for CI on that branch to go green (otherwise the image won't exist).
+3. Trigger `CD (dev)` against your branch:
+
+   - **In the GitHub UI** — Actions tab → "CD (dev)" → "Run workflow" →
+     change "Use workflow from" to your feature branch → leave `sha` empty →
+     "Run workflow". The job uses `github.sha` of the dispatched ref, which
+     is your branch's HEAD.
+   - **From the CLI** — `gh workflow run "CD (dev)" --ref feature/<x>`.
+
+`app-dev` will now run the feature branch's commit. Push another commit to
+the same branch and dispatch again to update — `cd-dev.yml` enforces
+`concurrency: cd-dev` so two parallel dev deploys can't fight over the
+namespace. To return `app-dev` to `main`, dispatch `CD (dev)` against `main`
+or just push to `main` and let CI fire CD automatically.
+
+### Register the self-hosted runner
+
+CD runs on a self-hosted runner labelled `microk8s`, which is the only thing
+that has direct `kubectl` access to the local cluster.
+
+**Prerequisites on the runner host:**
+
+- `kubectl` on `$PATH`, with kubeconfig pointing at the microk8s cluster
+  (`microk8s config > ~/.kube/config` works).
+- `kustomize` standalone binary on `$PATH` (the workflow uses
+  `kustomize edit`, which is not part of `kubectl kustomize`):
+
+  ```bash
+  curl -sLo /tmp/kustomize.tgz \
+    https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz
+  tar -xzf /tmp/kustomize.tgz -C /tmp
+  sudo install -m 0755 /tmp/kustomize /usr/local/bin/kustomize
+  kustomize version
+  ```
+
+**Register the runner** (do this once per host):
+
+1. Go to **GitHub → repo → Settings → Actions → Runners → New self-hosted
+   runner** and copy the registration token shown there. The token is
+   short-lived; generate it just before you run `./config.sh`.
+
+2. Install the runner under `/opt/actions-runner` and configure it:
+
+   ```bash
+   sudo mkdir -p /opt/actions-runner
+   sudo chown $USER:$USER /opt/actions-runner
+   cd /opt/actions-runner
+
+   curl -sLo runner.tgz \
+     https://github.com/actions/runner/releases/download/v2.319.1/actions-runner-linux-x64-2.319.1.tar.gz
+   tar xzf runner.tgz && rm runner.tgz
+
+   ./config.sh \
+     --url https://github.com/<owner>/cicd-python-webapp \
+     --token <REGISTRATION_TOKEN> \
+     --name microk8s-local \
+     --labels microk8s \
+     --work _work \
+     --unattended
+   ```
+
+   **Why `/opt`, not `$HOME`?** On Fedora/RHEL hosts with SELinux in enforcing
+   mode, files under `/home/<user>` are labeled `user_home_t`, which the
+   targeted policy forbids systemd from execing — the service unit fails with
+   `status=203/EXEC`. `/opt` is labeled `usr_t`, which systemd is allowed to
+   exec.
+
+   **If you extracted/moved into `/opt` from elsewhere**, the labels don't
+   auto-update — `cp -a` / `mv` preserve the source's `user_home_t` and the
+   service still fails. Force a relabel against the system policy:
+
+   ```bash
+   sudo restorecon -RFv /opt/actions-runner
+   ```
+
+3. Tell the runner where to find `kubectl` and the kubeconfig. The runner's
+   systemd unit starts with a clean environment, so jobs won't inherit your
+   shell's `$PATH` / `$KUBECONFIG`:
+
+   ```bash
+   cat > /opt/actions-runner/.env <<'EOF'
+   PATH=/home/<user>/.local/bin:/usr/local/bin:/usr/bin:/bin
+   KUBECONFIG=/home/<user>/.kube/config
+   EOF
+   ```
+
+4. Install + start it as a systemd service (so it survives reboot):
+
+   ```bash
+   sudo ./svc.sh install $USER
+   sudo ./svc.sh start
+   sudo ./svc.sh status
+   ```
+
+   The runner now picks up jobs targeted at `runs-on: [self-hosted, microk8s]`.
+
+**Verify** it's online: **GitHub → repo → Settings → Actions → Runners** —
+`microk8s-local` should be green / `Idle`.
+
+To **remove** the runner, from `/opt/actions-runner`:
+
+```bash
+sudo ./svc.sh stop
+sudo ./svc.sh uninstall
+./config.sh remove --token <REMOVAL_TOKEN>   # token from the same Settings page
+```

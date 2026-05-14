@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
     tags: ['v*']
   pull_request:
 
@@ -64,7 +64,12 @@ jobs:
   build-push:
     name: Build & push image (GHCR)
     needs: [lint, test]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # Push events only — never PRs (they can't safely use GHCR creds anyway).
+    # Includes feature branches so they can be deployed to dev on demand via
+    # `CD (dev)` workflow_dispatch. Tag-list rules in metadata-action keep the
+    # `main` floating tag pinned to the default branch and semver tags pinned
+    # to v* tag refs, so a feature push only adds a `sha-<short>` image.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
