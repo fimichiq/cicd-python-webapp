@@ -91,15 +91,29 @@ jobs:
         # The exec-based smoke test is actually a better health gate anyway:
         # it isolates "did the rollout produce a healthy pod" from "is the
         # ingress path working".
+        #
+        # Bind the smoke target to the NEW ReplicaSet (via pod-template-hash)
+        # instead of "any phase=Running pod for the deployment". After
+        # `rollout status` returns, an old-RS pod can still appear Running
+        # for a beat while the kubelet hasn't yet flipped it to
+        # Succeeded/Failed — but its containerd task is already gone, so
+        # `kubectl exec` fails with "task ... not found". This is also more
+        # semantically correct: we want to verify *this* revision.
         run: |
-          POD=$(kubectl get pod -n ${NAMESPACE} -l ${SELECTOR} \
+          NEW_RS=$(kubectl get rs -n ${NAMESPACE} -l ${SELECTOR} \
+            --sort-by=.metadata.creationTimestamp \
+            -o jsonpath='{.items[-1:].metadata.name}')
+          HASH=$(kubectl get rs -n ${NAMESPACE} "${NEW_RS}" \
+            -o jsonpath='{.metadata.labels.pod-template-hash}')
+          POD=$(kubectl get pod -n ${NAMESPACE} \
+            -l ${SELECTOR},pod-template-hash=${HASH} \
             --field-selector=status.phase=Running \
             -o jsonpath='{.items[0].metadata.name}')
           if [ -z "$POD" ]; then
-            echo "No running pod found for selector ${SELECTOR}" >&2
+            echo "No running pod found for new RS ${NEW_RS}" >&2
             exit 1
           fi
-          echo "Smoke-testing pod: $POD"
+          echo "Smoke-testing pod: $POD (RS=${NEW_RS})"
           kubectl exec -n ${NAMESPACE} "$POD" -- python -c "
           import json, sys, urllib.request
           body = urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read().decode()
