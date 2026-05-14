@@ -13,7 +13,7 @@ management — and includes the requested flow diagram.
 ```mermaid
 flowchart TB
   DEV([Developer])
-  GHCR[(GHCR registry<br/>cicd-python-webapp)]
+  GHCR[("GHCR registry\ncicd-python-webapp")]
 
   DEV -->|"git push branch / tag"| CI
 
@@ -22,7 +22,7 @@ flowchart TB
     L["ruff lint + format"]
     T["pytest + coverage"]
     B["docker buildx · multi-stage"]
-    P["push to GHCR<br/>tags: sha-XXX · main · semver"]
+    P["push to GHCR\ntags: sha-XXX · main · semver"]
     L --> T --> B --> P
   end
   CI --> GHCR
@@ -34,8 +34,8 @@ flowchart TB
 
   subgraph CD_DEV ["CD dev · self-hosted runner"]
     direction TB
-    DV1["kustomize set image<br/>+ apply overlays/dev"]
-    DV2[rollout status]
+    DV1["kustomize set image\n+ apply overlays/dev"]
+    DV2["rollout status"]
     DV3["smoke: GET /health"]
     DV1 --> DV2 --> DV3
   end
@@ -43,31 +43,31 @@ flowchart TB
   subgraph CD_STG ["CD staging · self-hosted runner"]
     direction TB
     SG0(["Required reviewer ✋"])
-    SG1["kustomize set image<br/>+ apply overlays/staging"]
-    SG2[rollout status]
-    SG3["smoke /, /health,<br/>/version=staging,<br/>secret_source=env"]
+    SG1["kustomize set image\n+ apply overlays/staging"]
+    SG2["rollout status"]
+    SG3["smoke /, /health,\n/version=staging,\nsecret_source=env"]
     SG0 --> SG1 --> SG2 --> SG3
   end
 
   subgraph CD_PROD ["CD prod · self-hosted runner"]
     direction TB
     PR0(["Required reviewer ✋"])
-    PR1["kustomize set image<br/>+ apply overlays/prod"]
-    PR2[rollout status]
-    PR3["smoke /, /health,<br/>/version=prod,<br/>secret_source=env"]
+    PR1["kustomize set image\n+ apply overlays/prod"]
+    PR2["rollout status"]
+    PR3["smoke /, /health,\n/version=prod,\nsecret_source=env"]
     PR0 --> PR1 --> PR2 --> PR3
   end
 
-  CD_DEV --> NS_DEV[(app-dev · 1 replica)]
-  CD_STG --> NS_STG[(app-staging · 2 replicas)]
-  CD_PROD --> NS_PROD[(app-prod · 3 replicas)]
+  CD_DEV --> NS_DEV[("app-dev · 1 replica")]
+  CD_STG --> NS_STG[("app-staging · 2 replicas")]
+  CD_PROD --> NS_PROD[("app-prod · 3 replicas")]
 
-  SS["SealedSecret<br/>app-secret"] -->|sealed-secrets<br/>controller decrypts| K_SECRET[Secret app-secret]
-  K_SECRET -.->|"envFrom<br/>SECRET_KEY, ADMIN_TOKEN"| NS_DEV
+  SS["SealedSecret\napp-secret"] -->|"sealed-secrets\ncontroller decrypts"| K_SECRET["Secret app-secret"]
+  K_SECRET -.->|"envFrom\nSECRET_KEY, ADMIN_TOKEN"| NS_DEV
   K_SECRET -.-> NS_STG
   K_SECRET -.-> NS_PROD
 
-  DV3 -.fail.-> AUTO["Auto-rollback<br/>kubectl rollout undo"]
+  DV3 -.fail.-> AUTO["Auto-rollback\nkubectl rollout undo"]
   SG3 -.fail.-> AUTO
   PR3 -.fail.-> AUTO
   AUTO -.-> NS_DEV
@@ -75,8 +75,8 @@ flowchart TB
   AUTO -.-> NS_PROD
 
   OPS([Operator])
-  OPS -->|gh workflow run Rollback| RB["Manual Rollback<br/>undo · to-revision · to-tag"]
-  RB -->|approval for staging+prod| NS_DEV
+  OPS -->|"gh workflow run Rollback"| RB["Manual Rollback\nundo · to-revision · to-tag"]
+  RB -->|"approval for staging+prod"| NS_DEV
   RB --> NS_STG
   RB --> NS_PROD
 ```
