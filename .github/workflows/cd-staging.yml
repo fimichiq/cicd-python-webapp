@@ -1,0 +1,164 @@
+name: CD (staging)
+
+# Promotes a release-candidate build to the local microk8s `app-staging`
+# namespace. Two ways in:
+#   - automatic: CI completes successfully for a `v*.*.*-rc*` tag push
+#   - manual:    workflow_dispatch with an explicit image tag (e.g. for hotfix
+#                rehearsal against staging from a sha-<short> build)
+# Either path requires the GitHub Environment "staging" to approve before any
+# kubectl calls run — that is the manual gate the exercise asks for.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (e.g. 0.1.0-rc1 or sha-abc1234). Required."
+        required: true
+        default: ""
+
+permissions:
+  contents: read
+
+# Don't overlap staging deploys — the namespace is single-tenant on this
+# cluster and `kubectl rollout status` gets confused when two apply -k runs
+# fight over the same Deployment generation.
+concurrency:
+  group: cd-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy-staging:
+    name: Deploy to app-staging
+    # Auto-trigger only when CI passed for a tag ref shaped like `v*-rc*`.
+    # workflow_run carries head_branch = the ref name; for tag pushes that
+    # ref name is the tag itself (no `refs/tags/` prefix).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v') &&
+       contains(github.event.workflow_run.head_branch, '-rc'))
+    runs-on: [self-hosted, microk8s]
+    # Approval gate. The "staging" Environment must be configured in repo
+    # Settings → Environments with at least one Required reviewer; the job
+    # pauses here until a reviewer clicks Approve. See README → "Promote to
+    # staging" for the one-time setup.
+    environment:
+      name: staging
+    timeout-minutes: 15
+    env:
+      NAMESPACE: app-staging
+      DEPLOYMENT: app
+      OVERLAY: k8s/overlays/staging
+      IMAGE_NAME: cicd-python-webapp
+      IMAGE_REPO: ghcr.io/fimichiq/cicd-python-webapp
+      SELECTOR: app.kubernetes.io/name=cicd-python-webapp
+    steps:
+      - name: Resolve image tag and source ref
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            IMAGE_TAG="${{ inputs.image_tag }}"
+            if [ -z "$IMAGE_TAG" ]; then
+              echo "::error::workflow_dispatch requires a non-empty image_tag input." >&2
+              exit 1
+            fi
+            REF="${{ github.sha }}"
+          else
+            # workflow_run path: head_branch is the tag name (e.g. v0.1.0-rc1).
+            # The CI's metadata-action publishes images tagged with the semver
+            # value (strip the leading 'v').
+            REF="${{ github.event.workflow_run.head_sha }}"
+            TAG_REF="${{ github.event.workflow_run.head_branch }}"
+            IMAGE_TAG="${TAG_REF#v}"
+          fi
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "Deploying ${REF} → image tag ${IMAGE_TAG}"
+
+      - name: Checkout that commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.ref }}
+
+      - name: Pin image tag in staging overlay
+        working-directory: ${{ env.OVERLAY }}
+        run: |
+          kustomize edit set image ${IMAGE_NAME}=${IMAGE_REPO}:${{ steps.resolve.outputs.image_tag }}
+          echo "--- kustomization after edit ---"
+          cat kustomization.yaml
+
+      - name: Apply overlay
+        run: kubectl apply -k ${OVERLAY}
+
+      - name: Wait for rollout
+        id: rollout
+        run: |
+          kubectl rollout status deployment/${DEPLOYMENT} -n ${NAMESPACE} --timeout=300s
+
+      - name: Integration tests (in-pod via kubectl exec)
+        id: smoke
+        # Same rationale as cd-dev.yml: ingress→pod is broken on this host, so
+        # we exec into the pod and hit 127.0.0.1 directly. For staging we check
+        # three endpoints (not just /health) and assert /version reports the
+        # right environment tag — that catches a "right image, wrong overlay"
+        # misconfiguration that a bare /health would miss.
+        run: |
+          POD=$(kubectl get pod -n ${NAMESPACE} -l ${SELECTOR} \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')
+          if [ -z "$POD" ]; then
+            echo "No running pod found for selector ${SELECTOR}" >&2
+            exit 1
+          fi
+          echo "Integration-testing pod: $POD"
+          kubectl exec -n ${NAMESPACE} "$POD" -- python -c "
+          import json, sys, urllib.request
+
+          def get(path):
+              return json.loads(
+                  urllib.request.urlopen(f'http://127.0.0.1:8000{path}', timeout=5)
+                  .read().decode()
+              )
+
+          checks = [
+              ('/',        lambda b: b.get('message') == 'cicd-python-webapp'),
+              ('/health',  lambda b: b.get('status') == 'ok'),
+              ('/version', lambda b: b.get('version') == 'staging'),
+          ]
+          failed = []
+          for path, ok in checks:
+              body = get(path)
+              status = 'PASS' if ok(body) else 'FAIL'
+              print(f'{status} {path} -> {body}')
+              if not ok(body):
+                  failed.append(path)
+          sys.exit(1 if failed else 0)
+          "
+
+      - name: Auto-rollback on failure
+        if: failure() && (steps.rollout.conclusion == 'failure' || steps.smoke.conclusion == 'failure')
+        run: |
+          echo "::warning::Staging deploy failed — rolling back deployment/${DEPLOYMENT} in ${NAMESPACE}."
+          kubectl rollout undo deployment/${DEPLOYMENT} -n ${NAMESPACE}
+          kubectl rollout status deployment/${DEPLOYMENT} -n ${NAMESPACE} --timeout=300s
+          echo "Rollback complete."
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### CD (staging) — ${{ job.status }}"
+            echo ""
+            echo "- Source ref: \`${{ steps.resolve.outputs.ref }}\`"
+            echo "- Image:      \`${IMAGE_REPO}:${{ steps.resolve.outputs.image_tag }}\`"
+            echo "- Namespace:  \`${NAMESPACE}\`"
+            echo ""
+            echo "Recent rollout history:"
+            echo '```'
+            kubectl rollout history deployment/${DEPLOYMENT} -n ${NAMESPACE} | tail -n 10 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

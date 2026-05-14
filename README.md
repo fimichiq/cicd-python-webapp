@@ -145,6 +145,60 @@ the same branch and dispatch again to update — `cd-dev.yml` enforces
 namespace. To return `app-dev` to `main`, dispatch `CD (dev)` against `main`
 or just push to `main` and let CI fire CD automatically.
 
+## Promote to `staging`
+
+The `CD (staging)` workflow (`.github/workflows/cd-staging.yml`) deploys a
+release-candidate to the `app-staging` namespace, gated by a manual approval
+step.
+
+Flow:
+
+1. Tag a commit on `main` (or any branch) with a release-candidate semver:
+
+   ```bash
+   git tag v0.1.0-rc1
+   git push origin v0.1.0-rc1
+   ```
+
+2. CI runs on the tag push and publishes the image to GHCR with the semver
+   tag (the leading `v` is stripped by `docker/metadata-action`), e.g.
+   `ghcr.io/<owner>/cicd-python-webapp:0.1.0-rc1`.
+3. `CD (staging)` is triggered via `workflow_run` once CI is green. It pauses
+   in the `staging` Environment waiting for a Required reviewer to approve.
+4. After approval: pin the image tag in `k8s/overlays/staging`, `kubectl
+   apply -k`, wait for rollout, run integration tests inside the pod
+   (`/`, `/health`, `/version` — the last one must report `version=staging`,
+   catching a wrong-overlay misconfiguration that a bare `/health` would
+   miss).
+5. On any failure: `kubectl rollout undo` and re-wait.
+
+You can also promote manually — useful for rehearsing staging against a
+feature commit without cutting an RC tag:
+
+```bash
+gh workflow run "CD (staging)" -f image_tag=sha-<short>
+# or:
+gh workflow run "CD (staging)" -f image_tag=0.1.0-rc1
+```
+
+### One-time setup — the `staging` GitHub Environment
+
+The approval gate lives in a repository Environment, not in the workflow
+file. Create it once:
+
+1. GitHub → repo → **Settings → Environments → New environment** → name it
+   `staging`.
+2. Under **Deployment protection rules**, enable **Required reviewers** and
+   add yourself (or whoever should approve staging deploys).
+3. Save. The next `CD (staging)` run will pause at the `Deploy to
+   app-staging` job until a reviewer clicks **Review deployments → Approve**
+   from the run page.
+
+Without this Environment, the workflow runs without a gate — the
+`environment: staging` field in the YAML is what *binds* the workflow to the
+Environment's protection rules, so the gate only exists once the Environment
+itself is configured in GitHub.
+
 ### Register the self-hosted runner
 
 CD runs on a self-hosted runner labelled `microk8s`, which is the only thing
