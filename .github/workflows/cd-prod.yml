@@ -1,63 +1,66 @@
-name: CD (staging)
+name: CD (prod)
 
-# Promotes a release-candidate build to the local microk8s `app-staging`
-# namespace. Two ways in:
-#   - automatic: CI completes successfully for a `v*.*.*-rc*` tag push
-#   - manual:    workflow_dispatch with an explicit image tag (e.g. for hotfix
-#                rehearsal against staging from a sha-<short> build)
-# Either path requires the GitHub Environment "staging" to approve before any
-# kubectl calls run — that is the manual gate the exercise asks for.
+# Promotes a final semver release to the local microk8s `app-prod` namespace.
+# Two ways in:
+#   - automatic: CI completes successfully for a final `v*.*.*` tag push.
+#                Release-candidate tags (`v*-rc*`) are excluded and flow
+#                through cd-staging instead.
+#   - manual:    workflow_dispatch with an explicit image tag — useful for
+#                hotfix rehearsals or for promoting a sha-<short> image
+#                directly without cutting a release tag first.
+# Either path requires the GitHub Environment "production" to approve before
+# any kubectl calls run.
 
 on:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
-    # Only RC tag builds (e.g. v0.1.0-rc1) trigger this workflow at all.
-    # For tag pushes the upstream run's head_branch is the tag name (no
-    # `refs/tags/` prefix), so the glob `v*-rc*` matches RC tags and
-    # nothing else — pushes to `main` or feature branches don't even
-    # create a skipped cd-staging run in the Actions UI.
-    branches: ['v*-rc*']
+    # Final release tags only. `v*` matches every v-prefixed tag and the
+    # `!v*-rc*` negation strips the RC ones — so v1.0.0 fires here, while
+    # v1.0.0-rc1 stays exclusive to cd-staging. GH Actions evaluates these
+    # patterns in order within a single `branches:` list.
+    branches:
+      - 'v*'
+      - '!v*-rc*'
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Image tag to deploy (e.g. 0.1.0-rc1 or sha-abc1234). Required."
+        description: "Image tag to deploy (e.g. 0.1.0 or sha-abc1234). Required."
         required: true
         default: ""
 
 permissions:
   contents: read
 
-# Don't overlap staging deploys — the namespace is single-tenant on this
-# cluster and `kubectl rollout status` gets confused when two apply -k runs
-# fight over the same Deployment generation.
+# Never overlap prod deploys — the namespace is single-tenant and parallel
+# rollouts confuse `kubectl rollout status`.
 concurrency:
-  group: cd-staging
+  group: cd-prod
   cancel-in-progress: false
 
 jobs:
-  deploy-staging:
-    name: Deploy to app-staging
-    # The "is this an RC tag?" gate lives in the `on.workflow_run.branches`
-    # filter above — by the time we get here, the upstream run is already
-    # known to be an RC tag build. We only need to confirm CI succeeded
-    # (workflow_dispatch bypasses that since it carries no parent run).
+  deploy-prod:
+    name: Deploy to app-prod
+    # The "is this a final release tag?" gate lives in the
+    # `on.workflow_run.branches` filter above. Here we only confirm CI
+    # succeeded (workflow_dispatch bypasses that since it carries no parent
+    # run).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, microk8s]
-    # Approval gate. The "staging" Environment must be configured in repo
+    # Approval gate. The "production" Environment must be configured in repo
     # Settings → Environments with at least one Required reviewer; the job
     # pauses here until a reviewer clicks Approve. See README → "Promote to
-    # staging" for the one-time setup. If the Environment doesn't exist yet,
+    # prod" for the one-time setup. If the Environment doesn't exist yet,
     # GitHub auto-creates it without any protection rules on first run — the
     # gate only activates once Required reviewers are added in Settings.
-    environment: staging
+    environment: production
     timeout-minutes: 15
     env:
-      NAMESPACE: app-staging
+      NAMESPACE: app-prod
       DEPLOYMENT: app
-      OVERLAY: k8s/overlays/staging
+      OVERLAY: k8s/overlays/prod
       IMAGE_NAME: cicd-python-webapp
       IMAGE_REPO: ghcr.io/fimichiq/cicd-python-webapp
       SELECTOR: app.kubernetes.io/name=cicd-python-webapp
@@ -73,7 +76,7 @@ jobs:
             fi
             REF="${{ github.sha }}"
           else
-            # workflow_run path: head_branch is the tag name (e.g. v0.1.0-rc1).
+            # workflow_run path: head_branch is the tag name (e.g. v1.0.0).
             # The CI's metadata-action publishes images tagged with the semver
             # value (strip the leading 'v').
             REF="${{ github.event.workflow_run.head_sha }}"
@@ -89,7 +92,7 @@ jobs:
         with:
           ref: ${{ steps.resolve.outputs.ref }}
 
-      - name: Pin image tag in staging overlay
+      - name: Pin image tag in prod overlay
         working-directory: ${{ env.OVERLAY }}
         run: |
           kustomize edit set image ${IMAGE_NAME}=${IMAGE_REPO}:${{ steps.resolve.outputs.image_tag }}
@@ -106,8 +109,8 @@ jobs:
 
       - name: Integration tests (in-pod via kubectl exec)
         id: smoke
-        # Same rationale as cd-dev.yml: ingress→pod is broken on this host, so
-        # we exec into the pod and hit 127.0.0.1 directly. For staging we check
+        # Same rationale as cd-dev/cd-staging: ingress→pod is broken on this
+        # host, so we exec into the pod and hit 127.0.0.1 directly. We check
         # three endpoints (not just /health) and assert /version reports the
         # right environment tag — that catches a "right image, wrong overlay"
         # misconfiguration that a bare /health would miss.
@@ -143,7 +146,7 @@ jobs:
           checks = [
               ('/',        lambda b: b.get('message') == 'cicd-python-webapp'),
               ('/health',  lambda b: b.get('status') == 'ok'),
-              ('/version', lambda b: b.get('version') == 'staging'),
+              ('/version', lambda b: b.get('version') == 'prod'),
           ]
           failed = []
           for path, ok in checks:
@@ -158,7 +161,7 @@ jobs:
       - name: Auto-rollback on failure
         if: failure() && (steps.rollout.conclusion == 'failure' || steps.smoke.conclusion == 'failure')
         run: |
-          echo "::warning::Staging deploy failed — rolling back deployment/${DEPLOYMENT} in ${NAMESPACE}."
+          echo "::warning::Prod deploy failed — rolling back deployment/${DEPLOYMENT} in ${NAMESPACE}."
           kubectl rollout undo deployment/${DEPLOYMENT} -n ${NAMESPACE}
           kubectl rollout status deployment/${DEPLOYMENT} -n ${NAMESPACE} --timeout=300s
           echo "Rollback complete."
@@ -168,7 +171,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "### CD (staging) — ${{ job.status }}"
+            echo "### CD (prod) — ${{ job.status }}"
             echo ""
             echo "- Source ref: \`${{ steps.resolve.outputs.ref }}\`"
             echo "- Image:      \`${IMAGE_REPO}:${{ steps.resolve.outputs.image_tag }}\`"

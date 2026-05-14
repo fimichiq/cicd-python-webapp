@@ -8,6 +8,10 @@ on:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
+    # Only CI runs whose source ref is `main` trigger this workflow at all.
+    # Feature-branch CI completions don't create a skipped cd-dev run in the
+    # Actions UI; if you want to deploy a feature branch's image, use the
+    # workflow_dispatch path below.
     branches: [main]
   # Manual trigger. Pick the source branch via GitHub's "Use workflow from"
   # dropdown — feature branches are supported as long as CI has already
@@ -31,11 +35,12 @@ concurrency:
 jobs:
   deploy-dev:
     name: Deploy to app-dev
-    # Only run when triggered by a successful CI on main, OR manually.
+    # The "is this main?" gate lives in the `on.workflow_run.branches`
+    # filter above. Here we only confirm CI succeeded (workflow_dispatch
+    # bypasses that since it carries no parent run).
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'main')
+      github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, microk8s]
     timeout-minutes: 10
     env:
