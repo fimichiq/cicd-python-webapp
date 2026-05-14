@@ -1,0 +1,180 @@
+name: Rollback
+
+# Manual "break-glass" rollback for any environment. The Environment binding
+# below is computed from the `environment` input — so a prod rollback waits
+# for the same Required reviewer that gates the forward cd-prod deploy.
+#
+# Three modes:
+#   undo         → kubectl rollout undo (return to the immediately previous
+#                  revision in the deployment's revision history)
+#   to-revision  → kubectl rollout undo --to-revision=N (jump to a specific
+#                  revision number from `kubectl rollout history`)
+#   to-tag       → kustomize edit set image + kubectl apply -k
+#                  (replay a known-good immutable image tag through the
+#                  overlay — works even if the revision history was trimmed
+#                  past the version you want)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      mode:
+        description: "Rollback strategy"
+        required: true
+        type: choice
+        options: [undo, to-revision, to-tag]
+      target:
+        description: "Revision number (for to-revision) or image tag (for to-tag). Ignored when mode=undo."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# Share the concurrency group with the forward-deploy workflows so a rollback
+# can never race against an in-flight deploy on the same namespace.
+concurrency:
+  group: cd-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Rollback ${{ inputs.environment }} (${{ inputs.mode }})
+    runs-on: [self-hosted, microk8s]
+    # Map the input to the matching GitHub Environment. The prod CD workflow
+    # uses `production` (not `prod`), so we re-map that one; staging and dev
+    # use their input value directly. dev has no protection rules — first
+    # rollback run will auto-create a `dev` Environment in GitHub without a
+    # gate, which is fine (dev is the "does it run" sandbox).
+    environment:
+      name: ${{ inputs.environment == 'prod' && 'production' || inputs.environment }}
+    timeout-minutes: 15
+    env:
+      NAMESPACE: app-${{ inputs.environment }}
+      DEPLOYMENT: app
+      OVERLAY: k8s/overlays/${{ inputs.environment }}
+      IMAGE_NAME: cicd-python-webapp
+      IMAGE_REPO: ghcr.io/fimichiq/cicd-python-webapp
+      SELECTOR: app.kubernetes.io/name=cicd-python-webapp
+    steps:
+      - name: Validate inputs
+        # `type: choice` already constrains mode/environment to known values,
+        # so we only need to assert that `target` matches the chosen mode.
+        run: |
+          MODE='${{ inputs.mode }}'
+          TARGET='${{ inputs.target }}'
+          case "$MODE" in
+            undo)
+              if [ -n "$TARGET" ]; then
+                echo "::warning::mode=undo ignores 'target' — value '$TARGET' will not be used."
+              fi
+              ;;
+            to-revision)
+              if ! [[ "$TARGET" =~ ^[0-9]+$ ]]; then
+                echo "::error::mode=to-revision requires a numeric 'target' (got '$TARGET')." >&2
+                exit 1
+              fi
+              ;;
+            to-tag)
+              if [ -z "$TARGET" ]; then
+                echo "::error::mode=to-tag requires a non-empty 'target' (image tag)." >&2
+                exit 1
+              fi
+              ;;
+          esac
+
+      - name: Checkout (only needed for to-tag mode)
+        if: inputs.mode == 'to-tag'
+        uses: actions/checkout@v4
+
+      - name: Show current rollout history
+        # Useful in the job log so the reviewer who approved the rollback can
+        # see what they're rolling back FROM and what revisions are reachable.
+        run: |
+          echo "=== Current rollout history for ${DEPLOYMENT} in ${NAMESPACE} ==="
+          kubectl rollout history deployment/${DEPLOYMENT} -n ${NAMESPACE}
+          echo ""
+          echo "=== Currently running image ==="
+          kubectl get deployment/${DEPLOYMENT} -n ${NAMESPACE} \
+            -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+
+      - name: Perform rollback
+        id: rollback
+        run: |
+          case '${{ inputs.mode }}' in
+            undo)
+              echo "Rolling back ${DEPLOYMENT} in ${NAMESPACE} to previous revision..."
+              kubectl rollout undo deployment/${DEPLOYMENT} -n ${NAMESPACE}
+              ;;
+            to-revision)
+              echo "Rolling back ${DEPLOYMENT} in ${NAMESPACE} to revision ${{ inputs.target }}..."
+              kubectl rollout undo deployment/${DEPLOYMENT} -n ${NAMESPACE} \
+                --to-revision=${{ inputs.target }}
+              ;;
+            to-tag)
+              echo "Re-deploying ${DEPLOYMENT} in ${NAMESPACE} with image tag ${{ inputs.target }}..."
+              cd ${OVERLAY}
+              kustomize edit set image ${IMAGE_NAME}=${IMAGE_REPO}:${{ inputs.target }}
+              echo "--- kustomization after edit ---"
+              cat kustomization.yaml
+              cd "${GITHUB_WORKSPACE}"
+              kubectl apply -k ${OVERLAY}
+              ;;
+          esac
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/${DEPLOYMENT} -n ${NAMESPACE} --timeout=300s
+
+      - name: Smoke test (in-pod /health via kubectl exec)
+        # Same race-safe selection as cd-dev/staging/prod: bind to the new
+        # ReplicaSet via pod-template-hash so we don't exec into a
+        # terminating old-RS pod whose containerd task is already gone.
+        # No auto-rollback on smoke failure — recursive rollback is a footgun.
+        # Smoke failure here means a human needs to look at it.
+        run: |
+          NEW_RS=$(kubectl get rs -n ${NAMESPACE} -l ${SELECTOR} \
+            --sort-by=.metadata.creationTimestamp \
+            -o jsonpath='{.items[-1:].metadata.name}')
+          HASH=$(kubectl get rs -n ${NAMESPACE} "${NEW_RS}" \
+            -o jsonpath='{.metadata.labels.pod-template-hash}')
+          POD=$(kubectl get pod -n ${NAMESPACE} \
+            -l ${SELECTOR},pod-template-hash=${HASH} \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')
+          if [ -z "$POD" ]; then
+            echo "No running pod found for new RS ${NEW_RS}" >&2
+            exit 1
+          fi
+          echo "Smoke-testing pod: $POD (RS=${NEW_RS})"
+          kubectl exec -n ${NAMESPACE} "$POD" -- python -c "
+          import json, sys, urllib.request
+          body = urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read().decode()
+          print(body)
+          sys.exit(0 if json.loads(body).get('status') == 'ok' else 1)
+          "
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Rollback (${{ inputs.environment }}) — ${{ job.status }}"
+            echo ""
+            echo "- Mode:      \`${{ inputs.mode }}\`"
+            echo "- Target:    \`${{ inputs.target }}\`"
+            echo "- Namespace: \`${NAMESPACE}\`"
+            echo ""
+            echo "Recent rollout history (after rollback):"
+            echo '```'
+            kubectl rollout history deployment/${DEPLOYMENT} -n ${NAMESPACE} | tail -n 10 || true
+            echo '```'
+            echo "Currently running image:"
+            echo '```'
+            kubectl get deployment/${DEPLOYMENT} -n ${NAMESPACE} \
+              -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

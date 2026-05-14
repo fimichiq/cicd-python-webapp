@@ -147,6 +147,13 @@ jobs:
               ('/',        lambda b: b.get('message') == 'cicd-python-webapp'),
               ('/health',  lambda b: b.get('status') == 'ok'),
               ('/version', lambda b: b.get('version') == 'prod'),
+              # Defense-in-depth: envFrom: secretRef already prevents the pod
+              # from starting if app-secret is missing. This second check
+              # catches a subtler failure: the Secret exists but doesn't
+              # supply SECRET_KEY (e.g. wrong key name in the SealedSecret) —
+              # the app would silently fall back to a generated key and
+              # sessions/CSRF would break across replicas.
+              ('/version', lambda b: b.get('secret_source') == 'env'),
           ]
           failed = []
           for path, ok in checks:

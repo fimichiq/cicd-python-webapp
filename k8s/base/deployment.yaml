@@ -49,6 +49,14 @@ spec:
                 configMapKeyRef:
                   name: app-config
                   key: APP_VERSION
+          envFrom:
+            # `app-secret` is materialized by the sealed-secrets controller
+            # from k8s/base/sealedsecret.yaml. Keys exposed: SECRET_KEY,
+            # ADMIN_TOKEN. The pod won't start until the controller has
+            # produced this Secret — that's an intentional fail-fast signal
+            # if the SealedSecret wasn't sealed against this cluster's key.
+            - secretRef:
+                name: app-secret
           livenessProbe:
             httpGet:
               path: /health

@@ -250,6 +250,208 @@ Same shape as the staging Environment, just a different name:
 3. Save. The next `CD (prod)` run will pause at the `Deploy to app-prod`
    job until a reviewer clicks **Review deployments → Approve**.
 
+## Rollback runbook
+
+Two layers of rollback are built in:
+
+1. **Automatic in-pipeline rollback** — every `CD (*)` workflow runs
+   `kubectl rollout undo` if its own rollout-status or smoke step fails.
+   This catches "the new revision crashes on boot or fails health checks
+   inside the first few minutes".
+2. **Manual break-glass rollback** — `.github/workflows/rollback.yml`,
+   triggered from the GitHub Actions UI (or `gh workflow run`). Use this
+   when a deploy went green in smoke but later degrades — e.g. a memory
+   leak, a wrong feature flag, a config drift the smoke test couldn't
+   catch.
+
+The manual workflow shares the `cd-<env>` concurrency group with the
+forward-deploy workflow, so a rollback and a deploy can never race against
+the same namespace. For `staging` and `prod` it also binds to the same
+GitHub Environment as the forward deploy — so a prod rollback waits for the
+same Required reviewer that gates `CD (prod)`.
+
+### Three scenarios
+
+**Scenario 1 — undo the last deploy (most common).** Latest revision is
+broken and the previous revision was healthy:
+
+```bash
+gh workflow run Rollback -f environment=prod -f mode=undo
+```
+
+This runs `kubectl rollout undo deployment/app -n app-prod` — Kubernetes
+flips back to the previous ReplicaSet, which is still in the cluster
+(deployments keep `revisionHistoryLimit=10` ReplicaSets by default).
+
+**Scenario 2 — jump to a specific older revision.** The last *two* deploys
+were both bad; you want the one three back:
+
+```bash
+# Inspect history first
+kubectl rollout history deployment/app -n app-prod
+# Output:
+# REVISION  CHANGE-CAUSE
+# 5         <none>
+# 6         <none>
+# 7         <none>   ← latest, broken
+# Re-target revision 5
+gh workflow run Rollback -f environment=prod -f mode=to-revision -f target=5
+```
+
+This runs `kubectl rollout undo --to-revision=5`. Caveat: rewinding can hit
+the `revisionHistoryLimit` cap — if revision 5 has been trimmed, the
+command errors. That's when scenario 3 saves you.
+
+**Scenario 3 — replay a known-good image tag.** You know `v0.0.9` was
+healthy, but its ReplicaSet has been garbage-collected from history:
+
+```bash
+gh workflow run Rollback -f environment=prod -f mode=to-tag -f target=0.0.9
+# or with an immutable sha-<short> tag:
+gh workflow run Rollback -f environment=prod -f mode=to-tag -f target=sha-abc1234
+```
+
+This re-pins `k8s/overlays/prod/kustomization.yaml` to the requested image
+tag and re-applies the overlay. Works for any tag that still exists in
+GHCR — including pre-release / sha- / floating tags. Useful as a "force a
+specific image" knob independent of Kubernetes' revision history.
+
+### Database migrations — out of scope
+
+This app has no database, so rollback is purely a stateless deployment
+swap. In a real system with a relational DB, a rollback of the app version
+without a paired rollback of the schema migration is unsafe — that's why
+production migration tooling typically requires **backward-compatible
+migrations**: add a column, deploy code that reads both old and new shapes,
+then drop the old column in a later release. The same `Rollback` workflow
+remains useful (it rolls back app code) but it cannot un-apply a
+migration; that's a separate story per-DB.
+
+## Manage secrets
+
+Two flavours of secret material live in this repo, on different layers:
+
+| Layer | Tool | Examples here |
+|---|---|---|
+| **Workflow** (GH Actions needs them) | GitHub Secrets | `GITHUB_TOKEN` for GHCR push, future `SLACK_WEBHOOK_URL` |
+| **Application** (running pod needs them) | **Bitnami Sealed Secrets** | `SECRET_KEY`, `ADMIN_TOKEN` |
+
+A `kind: Secret` in plain YAML is **not encrypted** — it's just base64.
+Committing one to git leaks the value. Sealed Secrets solve this:
+`kubeseal` encrypts the values against a **cluster-bound public key**, and
+the in-cluster controller is the only party with the matching private
+key. The encrypted file IS safe to commit; the same file is **useless on
+any other cluster** because no other cluster has the private key.
+
+### One-time cluster setup
+
+Install the controller into the cluster (any namespace; `kube-system` is
+conventional):
+
+```bash
+microk8s helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
+microk8s helm repo update
+microk8s helm install sealed-secrets sealed-secrets/sealed-secrets \
+  --namespace kube-system
+kubectl rollout status deployment/sealed-secrets -n kube-system
+```
+
+Install the `kubeseal` CLI on your workstation (any release ≥0.27 works):
+
+```bash
+KUBESEAL_VERSION=0.27.1
+curl -sLo /tmp/ks.tgz \
+  https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBESEAL_VERSION}/kubeseal-${KUBESEAL_VERSION}-linux-amd64.tar.gz
+tar -xzf /tmp/ks.tgz -C /tmp kubeseal
+sudo install -m 0755 /tmp/kubeseal /usr/local/bin/kubeseal
+kubeseal --version
+```
+
+### Generate `k8s/base/sealedsecret.yaml` for your cluster
+
+The committed file is a **placeholder**; you must regenerate it once
+against your cluster's keypair before the first deploy will succeed:
+
+```bash
+# 1. Build the raw Secret with real values (do NOT commit this intermediate file)
+kubectl create secret generic app-secret \
+  --from-literal=SECRET_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')" \
+  --from-literal=ADMIN_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')" \
+  --dry-run=client -o yaml > /tmp/app-secret.yaml
+
+# 2. Seal it against the cluster's pubkey, scoped cluster-wide so each
+#    overlay can adopt the same source in its own namespace.
+kubeseal --scope cluster-wide -o yaml < /tmp/app-secret.yaml > k8s/base/sealedsecret.yaml
+
+# 3. Shred the plain Secret immediately — only the encrypted file should
+#    leave this machine.
+shred -u /tmp/app-secret.yaml
+
+# 4. Commit the new sealedsecret.yaml.
+git add k8s/base/sealedsecret.yaml
+```
+
+After applying (`kubectl apply -k k8s/overlays/<env>`), the controller
+creates the matching `Secret app-secret` in the target namespace, and the
+app deployment picks up `SECRET_KEY` + `ADMIN_TOKEN` through
+`envFrom: secretRef`. Verify the pipeline end-to-end:
+
+```bash
+kubectl get sealedsecret -A
+kubectl get secret app-secret -n app-dev -o jsonpath='{.data}'   # decrypted
+curl -s http://dev.app.local/version                              # secret_source=env
+```
+
+If `/version` reports `"secret_source": "generated"` after a deploy, the
+SealedSecret wasn't decrypted — check `kubectl logs -n kube-system
+deployment/sealed-secrets` and re-run `kubeseal`. If the pod is stuck in
+`CreateContainerConfigError`, the underlying `Secret` was never produced
+(same root cause).
+
+### Rotation
+
+Rotation = regenerate the same `sealedsecret.yaml` against the same cluster
+with new plaintext values, then redeploy:
+
+```bash
+# Same kubeseal pipeline as above, with fresh tokens.
+kubectl create secret generic app-secret \
+  --from-literal=SECRET_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')" \
+  --from-literal=ADMIN_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')" \
+  --dry-run=client -o yaml | kubeseal --scope cluster-wide -o yaml \
+  > k8s/base/sealedsecret.yaml
+git commit -am "rotate app secrets"
+git push                            # triggers CI → CD; sealed-secrets controller
+                                    # updates the Secret; deployment rolls a new
+                                    # ReplicaSet because envFrom hash changes.
+```
+
+### Admin endpoint demo
+
+After a successful deploy, hit `/admin` with the rotated `ADMIN_TOKEN`:
+
+```bash
+# Inspect the decrypted token (locally; you'd normally read it from your
+# password manager or 1Password CLI rather than the cluster):
+TOKEN=$(kubectl get secret app-secret -n app-dev \
+  -o jsonpath='{.data.ADMIN_TOKEN}' | base64 -d)
+
+# Exec into the pod since ingress→pod is broken on this host
+POD=$(kubectl get pod -n app-dev -l app.kubernetes.io/name=cicd-python-webapp \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n app-dev "$POD" -- python -c "
+import os, urllib.request
+req = urllib.request.Request('http://127.0.0.1:8000/admin',
+    headers={'Authorization': f'Bearer {os.environ[\"ADMIN_TOKEN\"]}'})
+print(urllib.request.urlopen(req).read().decode())
+"
+```
+
+Empty/missing token → 401, wrong token → 401 (constant-time compared so
+length doesn't leak), correct token → `{"status": "authenticated",
+"message": "hello, admin"}`. The token comparison uses `hmac.compare_digest`
+to avoid timing side-channels.
+
 ## Register the self-hosted runner
 
 CD runs on a self-hosted runner labelled `microk8s`, which is the only thing
