@@ -40,6 +40,7 @@ sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status == 2
 CMD ["gunicorn", \
      "--bind", "0.0.0.0:8000", \
      "--workers", "2", \
+     "--graceful-timeout", "10", \
      "--access-logfile", "-", \
      "--error-logfile", "-", \
      "app.main:app"]

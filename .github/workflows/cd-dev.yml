@@ -80,7 +80,7 @@ jobs:
       - name: Wait for rollout
         id: rollout
         run: |
-          kubectl rollout status deployment/${DEPLOYMENT} -n ${NAMESPACE} --timeout=120s
+          kubectl rollout status deployment/${DEPLOYMENT} -n ${NAMESPACE} --timeout=300s
 
       - name: Smoke test (in-pod /health via kubectl exec)
         id: smoke
@@ -112,7 +112,7 @@ jobs:
         run: |
           echo "::warning::Deploy failed — rolling back deployment/${DEPLOYMENT} in ${NAMESPACE}."
           kubectl rollout undo deployment/${DEPLOYMENT} -n ${NAMESPACE}
-          kubectl rollout status deployment/${DEPLOYMENT} -n ${NAMESPACE} --timeout=120s
+          kubectl rollout status deployment/${DEPLOYMENT} -n ${NAMESPACE} --timeout=300s
           echo "Rollback complete."
           exit 1
 
