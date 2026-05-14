@@ -69,18 +69,26 @@ def test_admin_401_without_authorization_header(monkeypatch):
 
 def test_admin_401_with_non_bearer_scheme(monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
-    response = create_app().test_client().get(
-        "/admin",
-        headers={"Authorization": "Basic dXNlcjpwYXNz"},
+    response = (
+        create_app()
+        .test_client()
+        .get(
+            "/admin",
+            headers={"Authorization": "Basic dXNlcjpwYXNz"},
+        )
     )
     assert response.status_code == 401
 
 
 def test_admin_401_with_wrong_token(monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
-    response = create_app().test_client().get(
-        "/admin",
-        headers={"Authorization": "Bearer wrong"},
+    response = (
+        create_app()
+        .test_client()
+        .get(
+            "/admin",
+            headers={"Authorization": "Bearer wrong"},
+        )
     )
     assert response.status_code == 401
     assert response.get_json() == {"error": "invalid token"}
@@ -88,9 +96,13 @@ def test_admin_401_with_wrong_token(monkeypatch):
 
 def test_admin_200_with_correct_token(monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", "s3cret")
-    response = create_app().test_client().get(
-        "/admin",
-        headers={"Authorization": "Bearer s3cret"},
+    response = (
+        create_app()
+        .test_client()
+        .get(
+            "/admin",
+            headers={"Authorization": "Bearer s3cret"},
+        )
     )
     assert response.status_code == 200
     assert response.get_json() == {"status": "authenticated", "message": "hello, admin"}
